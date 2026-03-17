@@ -445,6 +445,7 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         vae_path=config.model.wan.vae_path,
         wan_config_path=config.model.wan.config_path,
         vlm_checkpoint_path=config.model.vlm.checkpoint_path,
+        enable_vlm=getattr(config.model.vlm, 'enabled', True),
         video_precision=config.model.wan.precision,
         action_state_dim=config.common.state_dim,
         action_dim=config.common.action_dim,

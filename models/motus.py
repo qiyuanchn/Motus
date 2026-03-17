@@ -38,6 +38,7 @@ class MotusConfig:
 
     # VLM settings
     vlm_checkpoint_path: str = ""
+    enable_vlm: bool = True
     
     # Understanding Expert settings - configurable from yaml
     und_expert_hidden_size: int = 512        # Understanding expert hidden dimension
@@ -211,10 +212,10 @@ class VideoModule(nn.Module):
         action_adaln_modulation: tuple,
         layer_idx: int,
         action_block: nn.Module,
-        und_tokens: torch.Tensor,
-        und_block: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
+        und_tokens: Optional[torch.Tensor] = None,
+        und_block: Optional[nn.Module] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Joint self-attention: WAN + Action, optionally + Understanding via WAN self-attn (MoT)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
 
         # AdaLN params (already computed)
@@ -238,16 +239,23 @@ class VideoModule(nn.Module):
         a_k = action_block.wan_action_norm_k(a_k_h.flatten(-2)).view(B, L_a, n, d)
         a_v = a_v_h.view(B, L_a, n, d)
 
-        # Understanding Expert processing
-        norm_und = und_block.norm1(und_tokens)
-        L_u = norm_und.shape[1]
-        
-        # Understanding Expert heads for WAN space (2048 -> 24*128)
-        u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
-        u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
-        u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
-        u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
-        u_v = u_v_h.view(B, L_u, n, d)
+        use_und = (und_tokens is not None) and (und_block is not None)
+        if use_und:
+            # Understanding Expert processing
+            norm_und = und_block.norm1(und_tokens)
+            L_u = norm_und.shape[1]
+            
+            # Understanding Expert heads for WAN space (2048 -> 24*128)
+            u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
+            u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
+            u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
+            u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
+            u_v = u_v_h.view(B, L_u, n, d)
+        else:
+            L_u = 0
+            u_q = None
+            u_k = None
+            u_v = None
 
         # Meta info for WAN attention
         seq_lens = torch.full((B,), L_v + L_a + L_u, dtype=torch.long, device=self.device)
@@ -255,21 +263,20 @@ class VideoModule(nn.Module):
         if freqs.device != self.device:
             freqs = freqs.to(self.device)
 
-        # Call WAN self-attn with trimodal MoT
+        # Call WAN self-attn with bimodal/trimodal MoT
         y, action_out_h, und_out_h = wan_layer.self_attn(
             norm_video, seq_lens, self.grid_sizes, freqs,
             action_q=a_q, action_k=a_k, action_v=a_v,
             und_q=u_q, und_k=u_k, und_v=u_v
         )
-        
-        # Project Understanding Expert output
-        und_out = und_block.wan_und_o(und_out_h.flatten(2))
 
         # Project back and residual connections
         action_out = action_block.wan_action_o(action_out_h.flatten(2))
         video_tokens = video_tokens + y * v_mod[2].squeeze(2)
         action_tokens = action_tokens + action_out * a_mod[2].squeeze(2)
-        und_tokens = und_tokens + und_out  # Regular residual connection
+        if use_und and und_out_h is not None:
+            und_out = und_block.wan_und_o(und_out_h.flatten(2))
+            und_tokens = und_tokens + und_out  # Regular residual connection
 
         return video_tokens, action_tokens, und_tokens
 
@@ -485,6 +492,7 @@ class Motus(nn.Module):
     def __init__(self, config: MotusConfig):
         super().__init__()
         self.config = config
+        self.enable_vlm = bool(config.enable_vlm)
 
         # Set unified data type for the model
         self.dtype = torch.bfloat16
@@ -509,45 +517,51 @@ class Motus(nn.Module):
                 precision=config.video_precision
             )
 
-        # Initialize VLM (frozen)
-        logger.info("Initializing VLM (frozen)...")
-        if load_backbones:
-            self.vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                config.vlm_checkpoint_path,
-                dtype=self.dtype,
-                device_map="cuda",
-                trust_remote_code=True
-            )
-            logger.info("Load pretrained VLM...")
+        self.vlm_model = None
+        if self.enable_vlm:
+            # Initialize VLM (frozen)
+            logger.info("Initializing VLM (frozen)...")
+            if load_backbones:
+                self.vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    config.vlm_checkpoint_path,
+                    dtype=self.dtype,
+                    device_map="cuda",
+                    trust_remote_code=True
+                )
+                logger.info("Load pretrained VLM...")
+            else:
+                vlm_cfg = AutoConfig.from_pretrained(config.vlm_checkpoint_path, trust_remote_code=True)
+                self.vlm_model = Qwen3VLForConditionalGeneration._from_config(vlm_cfg, torch_dtype=self.dtype)
+                # Move to CUDA and dtype explicitly
+                self.vlm_model.to(device="cuda", dtype=self.dtype)
+                logger.info("Initializing VLM from config...")
+
+            # Freeze VLM parameters
+            for param in self.vlm_model.parameters():
+                param.requires_grad = False
+            logger.info("VLM parameters frozen")
+
+            # Keep VLM complete (do not truncate)
+            logger.info(f"VLM kept complete with {len(self.vlm_model.model.language_model.layers)} layers")
         else:
-            vlm_cfg = AutoConfig.from_pretrained(config.vlm_checkpoint_path, trust_remote_code=True)
-            self.vlm_model = Qwen3VLForConditionalGeneration._from_config(vlm_cfg, torch_dtype=self.dtype)
-            # Move to CUDA and dtype explicitly
-            self.vlm_model.to(device="cuda", dtype=self.dtype)
-            logger.info("Initializing VLM from config...")
-
-        # Freeze VLM parameters
-        for param in self.vlm_model.parameters():
-            param.requires_grad = False
-        logger.info("VLM parameters frozen")
-
-        # Keep VLM complete (do not truncate)
-        logger.info(f"VLM kept complete with {len(self.vlm_model.model.language_model.layers)} layers")
+            logger.info("VLM disabled (enable_vlm=False). Running WAN + Action only.")
 
         # Get WAN and VLM configurations directly
         wan_dim = getattr(self.video_model.wan_model.config, 'dim', 3072)
         wan_num_heads = getattr(self.video_model.wan_model.config, 'num_heads', 24)
         wan_head_dim = wan_dim // wan_num_heads
 
-        vlm_dim = self.vlm_model.config.text_config.hidden_size
-        vlm_num_heads = self.vlm_model.config.text_config.num_attention_heads
-        vlm_num_kv_heads = getattr(self.vlm_model.config.text_config if hasattr(self.vlm_model.config, 'text_config') else self.vlm_model.config, 'num_key_value_heads', vlm_num_heads)
-        vlm_num_hidden_layers  = self.vlm_model.config.text_config.num_hidden_layers
-        vlm_head_dim = vlm_dim // vlm_num_heads
-
         logger.info(f"Model configurations:")
         logger.info(f"  WAN: {wan_num_heads} heads × {wan_head_dim} head_dim = {wan_dim}D")
-        logger.info(f"  VLM: {vlm_num_heads} Q heads, {vlm_num_kv_heads} KV heads × {vlm_head_dim} head_dim = {vlm_dim}D")
+        if self.enable_vlm:
+            vlm_dim = self.vlm_model.config.text_config.hidden_size
+            vlm_num_heads = self.vlm_model.config.text_config.num_attention_heads
+            vlm_num_kv_heads = getattr(self.vlm_model.config.text_config if hasattr(self.vlm_model.config, 'text_config') else self.vlm_model.config, 'num_key_value_heads', vlm_num_heads)
+            vlm_num_hidden_layers = self.vlm_model.config.text_config.num_hidden_layers
+            vlm_head_dim = vlm_dim // vlm_num_heads
+            logger.info(f"  VLM: {vlm_num_heads} Q heads, {vlm_num_kv_heads} KV heads × {vlm_head_dim} head_dim = {vlm_dim}D")
+        else:
+            vlm_config = None
 
         # Create config dictionaries for ActionExpert
         wan_config = {
@@ -555,13 +569,14 @@ class Motus(nn.Module):
             'num_heads': wan_num_heads, 
             'head_dim': wan_head_dim
         }
-        vlm_config = {
-            'hidden_size': vlm_dim,
-            'num_attention_heads': vlm_num_heads,
-            'num_key_value_heads': vlm_num_kv_heads,
-            'head_dim': vlm_head_dim,
-            'num_hidden_layers': vlm_num_hidden_layers,
-        }
+        if self.enable_vlm:
+            vlm_config = {
+                'hidden_size': vlm_dim,
+                'num_attention_heads': vlm_num_heads,
+                'num_key_value_heads': vlm_num_kv_heads,
+                'head_dim': vlm_head_dim,
+                'num_hidden_layers': vlm_num_hidden_layers,
+            }
 
         # Initialize action expert with unified configs
         logger.info("Initializing Action Expert...")
@@ -591,23 +606,27 @@ class Motus(nn.Module):
 
         self.action_expert = ActionExpert(action_config, wan_config)
 
-        # Initialize Understanding Expert
-        logger.info("Initializing Understanding Expert...")
-        und_config = UndExpertConfig(
-            dim=config.und_expert_hidden_size,
-            ffn_dim=config.und_expert_hidden_size * config.und_expert_ffn_dim_multiplier,
-            num_layers=config.num_layers,
-            vlm_input_dim=config.vlm_adapter_input_dim,
-            vlm_projector_type=config.vlm_adapter_projector_type,
-            eps=config.und_expert_norm_eps,
-        )
-        
-        self.und_expert = UndExpert(und_config, wan_config, vlm_config)
+        # Initialize Understanding Expert (optional)
+        if self.enable_vlm:
+            logger.info("Initializing Understanding Expert...")
+            und_config = UndExpertConfig(
+                dim=config.und_expert_hidden_size,
+                ffn_dim=config.und_expert_hidden_size * config.und_expert_ffn_dim_multiplier,
+                num_layers=config.num_layers,
+                vlm_input_dim=config.vlm_adapter_input_dim,
+                vlm_projector_type=config.vlm_adapter_projector_type,
+                eps=config.und_expert_norm_eps,
+            )
+            self.und_expert = UndExpert(und_config, wan_config, vlm_config)
+        else:
+            self.und_expert = None
+            logger.info("Understanding Expert disabled because VLM is disabled.")
 
         # Move models to device
         self.device = next(self.video_model.parameters()).device
         self.action_expert.to(device=self.device, dtype=self.dtype)
-        self.und_expert.to(device=self.device, dtype=self.dtype)
+        if self.und_expert is not None:
+            self.und_expert.to(device=self.device, dtype=self.dtype)
         
         # Set time embedding layers to float32 for numerical stability
         self.action_expert.time_embedding.to(dtype=torch.float32)
@@ -628,7 +647,10 @@ class Motus(nn.Module):
 
         # Initialize modular components
         self.video_module = VideoModule(self.video_model, self.dtype, self.device, self.grid_sizes)
-        self.und_module = UndModule(self.vlm_model, self.und_expert, self.config, self.dtype, self.device)
+        if self.enable_vlm:
+            self.und_module = UndModule(self.vlm_model, self.und_expert, self.config, self.dtype, self.device)
+        else:
+            self.und_module = None
         self.action_module = ActionModule(self.action_expert, self.config, self.video_model, self.vlm_model, self.dtype, self.device)
 
         # Initialize t distributions from config
@@ -678,16 +700,22 @@ class Motus(nn.Module):
 
         video_params = sum(p.numel() for p in self.video_model.parameters())
         action_params = sum(p.numel() for p in self.action_expert.parameters())
-        vlm_params = sum(p.numel() for p in self.vlm_model.parameters())
-        und_params = sum(p.numel() for p in self.und_expert.parameters())
+        vlm_params = sum(p.numel() for p in self.vlm_model.parameters()) if self.vlm_model is not None else 0
+        und_params = sum(p.numel() for p in self.und_expert.parameters()) if self.und_expert is not None else 0
 
         logger.info(f"Motus parameter breakdown:")
         logger.info(f"  Total parameters: {total_params / 1e9:.2f}B")
         logger.info(f"  Trainable parameters: {trainable_params / 1e9:.2f}B")
         logger.info(f"  Video Model (WAN): {video_params / 1e9:.2f}B")
         logger.info(f"  Action Expert: {action_params / 1e6:.1f}M")
-        logger.info(f"  VLM (frozen): {vlm_params / 1e9:.2f}B")
-        logger.info(f"  Und Expert: {und_params / 1e6:.1f}M")
+        if self.vlm_model is not None:
+            logger.info(f"  VLM (frozen): {vlm_params / 1e9:.2f}B")
+        else:
+            logger.info("  VLM (frozen): disabled")
+        if self.und_expert is not None:
+            logger.info(f"  Und Expert: {und_params / 1e6:.1f}M")
+        else:
+            logger.info("  Und Expert: disabled")
 
     def load_checkpoint(self, path: str, strict: bool = True) -> Dict:
         """Load model checkpoint."""
@@ -837,7 +865,12 @@ class Motus(nn.Module):
             state_tokens = state.unsqueeze(1).to(self.dtype)
             action_tokens = self.action_expert.input_encoder(state_tokens, noisy_actions, registers)
 
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, seq_len, und_dim]
+        if self.enable_vlm:
+            if vlm_inputs is None:
+                raise ValueError("vlm_inputs is required when enable_vlm=True")
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, seq_len, und_dim]
+        else:
+            und_tokens = None
 
         # Time embeddings
         # Use scheduler-provided timesteps (0..num_train_timesteps) for WAN/action time embeddings
@@ -855,12 +888,20 @@ class Motus(nn.Module):
                 video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
                 action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
                 
-                # Trimodal MoT: WAN + Action + Understanding Expert joint attention
-                video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
-                    video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
-                    self.action_expert.blocks[layer_idx],
-                    und_tokens, self.und_expert.blocks[layer_idx]
-                )
+                if self.enable_vlm:
+                    # Trimodal MoT: WAN + Action + Understanding Expert joint attention
+                    video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
+                        video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
+                        self.action_expert.blocks[layer_idx],
+                        und_tokens, self.und_expert.blocks[layer_idx]
+                    )
+                else:
+                    # Bimodal MoT: WAN + Action only
+                    video_tokens, action_tokens, _ = self.video_module.process_joint_attention(
+                        video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
+                        self.action_expert.blocks[layer_idx],
+                        None, None
+                    )
 
                 # WAN cross
                 video_tokens = self.video_module.process_cross_attention(video_tokens, video_adaln_params, layer_idx, processed_t5_context)
@@ -868,7 +909,8 @@ class Motus(nn.Module):
                 # FFNs: WAN, Action, Understanding (each processes their own FFN)
                 video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
                 action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+                if self.enable_vlm:
+                    und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
                 
         
             # 4. Heads + Losses
@@ -945,9 +987,13 @@ class Motus(nn.Module):
         action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
         action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
 
-        # 2. Understanding Expert features and T5 context
-        # Extract understanding features from VLM
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        # 2. Optional understanding features and T5 context
+        if self.enable_vlm:
+            if vlm_inputs is None:
+                raise ValueError("vlm_inputs is required when enable_vlm=True")
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        else:
+            und_tokens = None
 
         # T5 preprocess
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
@@ -969,8 +1015,9 @@ class Motus(nn.Module):
             registers = self.action_expert.registers.expand(B, -1, -1)  # [B, num_registers, dim]
             action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
 
-            # Note: Understanding tokens already extracted before the loop, will be updated in joint attention
-            und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, num_queries * num_layers, und_dim]
+            if self.enable_vlm:
+                # Understanding tokens already extracted before the loop, will be updated in joint attention
+                und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, num_queries * num_layers, und_dim]
 
             
             # Trimodal MoT forward - joint denoising for WAN, Action, Understanding
@@ -985,12 +1032,20 @@ class Motus(nn.Module):
                     video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
                     action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
                     
-                    # Trimodal joint attention: WAN + Action + Understanding
-                    video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
-                        video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
-                        self.action_expert.blocks[layer_idx],
-                        und_tokens, self.und_expert.blocks[layer_idx]
-                    )
+                    if self.enable_vlm:
+                        # Trimodal joint attention: WAN + Action + Understanding
+                        video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
+                            video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
+                            self.action_expert.blocks[layer_idx],
+                            und_tokens, self.und_expert.blocks[layer_idx]
+                        )
+                    else:
+                        # Bimodal joint attention: WAN + Action only
+                        video_tokens, action_tokens, _ = self.video_module.process_joint_attention(
+                            video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
+                            self.action_expert.blocks[layer_idx],
+                            None, None
+                        )
 
                     # WAN cross-attention with T5 embeddings 
                     video_tokens = self.video_module.process_cross_attention(
@@ -1000,7 +1055,8 @@ class Motus(nn.Module):
                     # FFNs: WAN, Action, Understanding
                     video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
                     action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                    und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+                    if self.enable_vlm:
+                        und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
 
                 # Heads (velocities)
                 video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)

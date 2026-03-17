@@ -47,6 +47,7 @@ model:
   
   # VLM settings
   vlm:
+    enabled: true             # Set false to run Motus inference with WAN+Action only (no Qwen/VLM)
     checkpoint_path: "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true              # Whether to freeze VLM parameters

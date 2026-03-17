@@ -159,12 +159,15 @@ def save_frame_grid(condition_frame: torch.Tensor, predicted_frames: torch.Tenso
 def create_motus_from_yaml(config_dict: Dict[str, Any], device: torch.device) -> Motus:
     common = config_dict['common']
     model_cfg = config_dict['model']
+    vlm_cfg = model_cfg.get('vlm', {})
+    enable_vlm = bool(vlm_cfg.get('enabled', True))
     mc = MotusConfig(
         wan_checkpoint_path=model_cfg['wan']['checkpoint_path'],
         vae_path=model_cfg['wan']['vae_path'],
         wan_config_path=model_cfg['wan']['config_path'],
         video_precision=model_cfg['wan']['precision'],
-        vlm_checkpoint_path=model_cfg['vlm']['checkpoint_path'],
+        vlm_checkpoint_path=vlm_cfg.get('checkpoint_path', ""),
+        enable_vlm=enable_vlm,
         und_expert_hidden_size=model_cfg.get('und_expert', {}).get('hidden_size', 512),
         und_expert_ffn_dim_multiplier=model_cfg.get('und_expert', {}).get('ffn_dim_multiplier', 4),
         und_expert_norm_eps=model_cfg.get('und_expert', {}).get('norm_eps', 1e-5),
@@ -227,11 +230,15 @@ def main():
     state_dim = int(cfg['common']['state_dim'])
     state = torch.zeros((1, state_dim), dtype=torch.bfloat16, device=device)  # no env, zero state
 
-    # Build VLM inputs
-    vlm_ckpt = cfg['model']['vlm']['checkpoint_path']
-    processor = AutoProcessor.from_pretrained(vlm_ckpt, trust_remote_code=True)
-    first_frame_pil = Image.open(args.image).convert("RGB").resize((W, H), Image.BICUBIC)
-    vlm_inputs = build_vlm_inputs(processor, args.instruction, first_frame_pil, device)
+    use_vlm = bool(cfg.get('model', {}).get('vlm', {}).get('enabled', True))
+    if use_vlm:
+        # Build VLM inputs
+        vlm_ckpt = cfg['model']['vlm']['checkpoint_path']
+        processor = AutoProcessor.from_pretrained(vlm_ckpt, trust_remote_code=True)
+        first_frame_pil = Image.open(args.image).convert("RGB").resize((W, H), Image.BICUBIC)
+        vlm_inputs = build_vlm_inputs(processor, args.instruction, first_frame_pil, device)
+    else:
+        vlm_inputs = None
 
     # Build T5 embeddings
     if args.use_t5:
@@ -268,7 +275,7 @@ def main():
             state=state,
             num_inference_steps=cfg['model']['inference']['num_inference_timesteps'],
             language_embeddings=language_embeddings,
-            vlm_inputs=[vlm_inputs],
+            vlm_inputs=[vlm_inputs] if vlm_inputs is not None else None,
         )
 
     # Save frames grid
