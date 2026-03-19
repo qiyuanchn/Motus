@@ -40,14 +40,14 @@ dataset:
 model:
   # WAN Video Model settings
   wan:
-    config_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    checkpoint_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    config_path: "/home/zqy/ws/Wan2.2/Wan2.2-TI2V-5B"
+    checkpoint_path: "/home/zqy/ws/Wan2.2/Wan2.2-TI2V-5B"
+    vae_path: "/home/zqy/ws/Wan2.2/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
     precision: "bfloat16"
   
   # VLM settings
   vlm:
-    enabled: true             # Set false to run Motus inference with WAN+Action only (no Qwen/VLM)
+    enabled: false            # Set false to run Motus inference with WAN+Action only (no Qwen/VLM)
     checkpoint_path: "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true              # Whether to freeze VLM parameters
@@ -59,7 +59,7 @@ model:
     ffn_dim_multiplier: 4   # FFN = hidden_size * multiplier
     
     # Normalization and regularization
-    norm_eps: 1e-5         # Layer norm epsilon
+    norm_eps: 1.0e-5       # Layer norm epsilon
     
     # Input/Output dimensions (will be calculated from sampling parameters)
     # chunk_size: 16         # Will be calculated as action_chunk_size + 1
@@ -71,7 +71,7 @@ model:
     ffn_dim_multiplier: 4   # FFN = hidden_size * multiplier
     
     # Normalization and regularization
-    norm_eps: 1e-5         # Layer norm epsilon
+    norm_eps: 1.0e-5       # Layer norm epsilon
     
     # VLM adapter settings
     vlm:
